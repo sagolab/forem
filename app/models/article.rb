@@ -445,6 +445,14 @@ class Article < ApplicationRecord
   end
 
   def has_frontmatter?
+    if FeatureFlag.enabled?(:consistent_rendering, FeatureFlag::Actor[user])
+      processed_content.has_front_matter?
+    else
+      original_has_frontmatter?
+    end
+  end
+
+  def original_has_frontmatter?
     fixed_body_markdown = MarkdownProcessor::Fixer::FixAll.call(body_markdown)
     begin
       parsed = FrontMatterParser::Parser.new(:md).call(fixed_body_markdown)
@@ -620,7 +628,42 @@ class Article < ApplicationRecord
       .strip
   end
 
+  def processed_content
+    return @processed_content if @processed_content && !body_markdown_changed?
+    return unless user
+
+    @processed_content = ContentRenderer.new(body_markdown, source: self, user: user)
+  end
+
   def evaluate_markdown
+    if FeatureFlag.enabled?(:consistent_rendering, FeatureFlag::Actor[user])
+      extracted_evaluate_markdown
+    else
+      original_evaluate_markdown
+    end
+  end
+
+  def extracted_evaluate_markdown
+    content_renderer = processed_content
+    return unless content_renderer
+
+    self.processed_html = content_renderer.process(calculate_reading_time: true)
+    self.reading_time = content_renderer.reading_time
+
+    front_matter = content_renderer.front_matter
+
+    if front_matter.any?
+      evaluate_front_matter(front_matter)
+    elsif tag_list.any?
+      set_tag_list(tag_list)
+    end
+
+    self.description = processed_description if description.blank?
+  rescue ContentRenderer::ContentParsingError => e
+    errors.add(:base, ErrorMessages::Clean.call(e.message))
+  end
+
+  def original_evaluate_markdown
     fixed_body_markdown = MarkdownProcessor::Fixer::FixAll.call(body_markdown || "")
     parsed = FrontMatterParser::Parser.new(:md).call(fixed_body_markdown)
     parsed_markdown = MarkdownProcessor::Parser.new(parsed.content, source: self, user: user)
@@ -686,31 +729,31 @@ class Article < ApplicationRecord
     Articles::BustMultipleCachesWorker.perform_bulk(job_params)
   end
 
-  def evaluate_front_matter(front_matter)
-    self.title = front_matter["title"] if front_matter["title"].present?
-    set_tag_list(front_matter["tags"]) if front_matter["tags"].present?
-    self.published = front_matter["published"] if %w[true false].include?(front_matter["published"].to_s)
+  def evaluate_front_matter(hash)
+    self.title = hash["title"] if hash["title"].present?
+    set_tag_list(hash["tags"]) if hash["tags"].present?
+    self.published = hash["published"] if %w[true false].include?(hash["published"].to_s)
 
-    self.published_at = front_matter["published_at"] if front_matter["published_at"]
-    self.published_at ||= parse_date(front_matter["date"]) if published
+    self.published_at = hash["published_at"] if hash["published_at"]
+    self.published_at ||= parse_date(hash["date"]) if published
 
-    set_main_image(front_matter)
-    self.canonical_url = front_matter["canonical_url"] if front_matter["canonical_url"].present?
+    set_main_image(hash)
+    self.canonical_url = hash["canonical_url"] if hash["canonical_url"].present?
 
-    update_description = front_matter["description"].present? || front_matter["title"].present?
-    self.description = front_matter["description"] if update_description
+    update_description = hash["description"].present? || hash["title"].present?
+    self.description = hash["description"] if update_description
 
-    self.collection_id = nil if front_matter["title"].present?
-    self.collection_id = Collection.find_series(front_matter["series"], user).id if front_matter["series"].present?
+    self.collection_id = nil if hash["title"].present?
+    self.collection_id = Collection.find_series(hash["series"], user).id if hash["series"].present?
   end
 
-  def set_main_image(front_matter)
+  def set_main_image(hash)
     # At one point, we have set the main_image based on the front matter. Forever will that now dictate the behavior.
     if main_image_from_frontmatter?
-      self.main_image = front_matter["cover_image"]
-    elsif front_matter.key?("cover_image")
+      self.main_image = hash["cover_image"]
+    elsif hash.key?("cover_image")
       # They've chosen the set cover image in the front matter, so we'll proceed with that assumption.
-      self.main_image = front_matter["cover_image"]
+      self.main_image = hash["cover_image"]
       self.main_image_from_frontmatter = true
     end
   end
@@ -879,7 +922,7 @@ class Article < ApplicationRecord
   end
 
   def title_to_slug
-    "#{Sterile.sluggerize(title)}-#{rand(100_000).to_s(26)}" # rubocop:disable Rails/ToSWithArgument
+    "#{Sterile.sluggerize(title)}-#{rand(100_000).to_s(26)}"
   end
 
   def touch_actor_latest_article_updated_at(destroying: false)
